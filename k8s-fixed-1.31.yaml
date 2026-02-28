@@ -1,0 +1,355 @@
+---
+- name: Kubernetes 1.31 Cluster Setup
+  hosts: k8s_cluster
+  become: yes
+  vars:
+    kubernetes_version: "1.31.0-1.1"
+    pod_network_cidr: "192.168.0.0/16"
+    pause_image: "registry.k8s.io/pause:3.10"
+
+  tasks:
+
+  #################################################
+  # System prep
+  #################################################
+  - name: Disable swap if enabled
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Ensure swap is disabled on reboot
+    lineinfile:
+      path: /etc/fstab
+      regexp: '^([^#].*swap.*)$'
+      line: '# \1'
+      backup: yes
+
+  - name: Load kernel modules
+    modprobe:
+      name: "{{ item }}"
+      state: present
+    loop:
+      - br_netfilter
+      - overlay
+
+  - name: Ensure kernel modules load on boot
+    copy:
+      dest: /etc/modules-load.d/k8s.conf
+      content: |
+        br_netfilter
+        overlay
+
+  - name: Set sysctl params for Kubernetes
+    sysctl:
+      name: "{{ item.key }}"
+      value: "{{ item.value }}"
+      state: present
+      reload: yes
+    loop:
+      - { key: 'net.bridge.bridge-nf-call-ip6tables', value: 1 }
+      - { key: 'net.bridge.bridge-nf-call-iptables', value: 1 }
+      - { key: 'net.ipv4.ip_forward', value: 1 }
+      - { key: 'net.ipv6.conf.all.forwarding', value: 1 }
+
+  #################################################
+  # Install prerequisites
+  #################################################
+  - name: Ensure apt keyrings directory exists
+    file:
+      path: /etc/apt/keyrings
+      state: directory
+      mode: '0755'
+
+  - name: Download Kubernetes apt key
+    get_url:
+      url: https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key
+      dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+      mode: '0644'
+
+  - name: Install Kubernetes apt sources
+    apt_repository:
+      repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /
+      state: present
+
+  - name: Update apt cache
+    apt:
+      update_cache: yes
+
+  #################################################
+  # Install containerd
+  #################################################
+  - name: Install containerd
+    apt:
+      name: containerd
+      state: present
+
+  - name: Create containerd config if missing
+    shell: |
+      mkdir -p /etc/containerd
+      containerd config default > /etc/containerd/config.toml
+    args:
+      creates: /etc/containerd/config.toml
+  
+  # - name: Ensure containerd uses systemd cgroups
+  #   block:
+  #     - name: Replace SystemdCgroup = false with true in the existing section
+  #       replace:
+  #         path: /etc/containerd/config.toml
+  #         regexp: '^(?P<pre>\s*SystemdCgroup\s*=\s*)false'
+  #         replace: '\g<pre>true'
+
+  #     - name: Ensure sandbox_image is set correctly
+  #       replace:
+  #         path: /etc/containerd/config.toml
+  #         regexp: '^(?P<pre>\s*sandbox_image\s*=).*'
+  #         replace: '\g<pre> "registry.k8s.io/pause:3.10"'      
+
+  #   notify:
+  #     - Restart containerd
+
+  - name: Ensure containerd config exists
+    file:
+      path: /etc/containerd/config.toml
+      state: touch
+    become: yes
+
+  - name: Set containerd to use systemd cgroups
+    replace:
+      path: /etc/containerd/config.toml
+      regexp: '^(?P<pre>\s*SystemdCgroup\s*=\s*).*'
+      replace: '\g<pre>true'
+      backup: yes
+    become: yes
+
+  - name: Ensure containerd uses correct pause image
+    replace:
+      path: /etc/containerd/config.toml
+      regexp: '^(?P<pre>\s*sandbox_image\s*=).*'
+      replace: '\g<pre> "registry.k8s.io/pause:3.10"'
+      backup: yes
+    become: yes
+
+  - name: Restart containerd if config changed
+    service:
+      name: containerd
+      state: restarted
+    become: yes
+
+  #################################################
+  # Install Kubernetes components
+  #################################################
+  - name: Install kubelet, kubeadm, kubectl
+    apt:
+      name:
+        - kubelet={{ kubernetes_version }}
+        - kubeadm={{ kubernetes_version }}
+        - kubectl={{ kubernetes_version }}
+      state: present
+      update_cache: yes
+
+  - name: Hold Kubernetes packages
+    command: apt-mark hold kubelet kubeadm kubectl
+
+  #################################################
+  # Self-healing: reset if previous install failed
+  #################################################
+  - name: Check if previous kubeadm admin.conf exists
+    stat:
+      path: /etc/kubernetes/admin.conf
+    register: kubeadm_conf
+
+  - name: Check cluster health if admin.conf exists
+    command: kubectl get nodes --kubeconfig=/etc/kubernetes/admin.conf
+    register: cluster_check
+    failed_when: false
+    changed_when: false
+    when: kubeadm_conf.stat.exists and inventory_hostname in groups['k8s_control_plane']
+
+  - name: Reset kubeadm if cluster is broken
+    command: kubeadm reset -f
+    when:
+      - kubeadm_conf.stat.exists
+      - inventory_hostname in groups['k8s_control_plane']
+      - cluster_check.rc != 0
+
+  #################################################
+  # Initialize control plane
+  #################################################
+  - name: Initialize Kubernetes control plane
+    command: >
+      kubeadm init
+      --pod-network-cidr={{ pod_network_cidr }}
+      --kubernetes-version={{ kubernetes_version.split('-')[0] }}
+    register: kubeadm_init
+    args:
+      creates: /etc/kubernetes/admin.conf
+    when: inventory_hostname in groups['k8s_control_plane']
+
+  - name: Start kubelet
+    systemd:
+      name: kubelet
+      state: started
+      enabled: yes
+    when: inventory_hostname in groups['k8s_control_plane']
+
+  # #################################################
+  # # kubeconfig setup for root and ubuntu
+  # #################################################
+  # - name: Create .kube directory for root
+  #   file:
+  #     path: /root/.kube
+  #     state: directory
+  #     mode: 0700
+
+  # - name: Copy kubeconfig for root
+  #   copy:
+  #     src: /etc/kubernetes/admin.conf
+  #     dest: /root/.kube/config
+  #     remote_src: yes
+  #     mode: 0600
+
+  # - name: Create .kube directory for ubuntu
+  #   file:
+  #     path: /home/ubuntu/.kube
+  #     state: directory
+  #     owner: ubuntu
+  #     group: ubuntu
+  #     mode: 0755
+
+  # - name: Copy kubeconfig for ubuntu
+  #   copy:
+  #     src: /etc/kubernetes/admin.conf
+  #     dest: /home/ubuntu/.kube/config
+  #     remote_src: yes
+  #     owner: ubuntu
+  #     group: ubuntu
+  #     mode: 0600
+#################################################
+# kubeconfig setup for root and ubuntu
+#################################################
+  - name: Create .kube directory for root
+    file:
+      path: /root/.kube
+      state: directory
+      mode: 0700
+    when: inventory_hostname in groups['k8s_control_plane']
+
+  - name: Copy kubeconfig for root
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: /root/.kube/config
+      remote_src: yes
+      mode: 0600
+    when: inventory_hostname in groups['k8s_control_plane']
+
+  - name: Create .kube directory for ubuntu
+    file:
+      path: /home/ubuntu/.kube
+      state: directory
+      owner: ubuntu
+      group: ubuntu
+      mode: 0755
+    when: inventory_hostname in groups['k8s_control_plane']
+
+  - name: Copy kubeconfig for ubuntu
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: /home/ubuntu/.kube/config
+      remote_src: yes
+      owner: ubuntu
+      group: ubuntu
+      mode: 0600
+    when: inventory_hostname in groups['k8s_control_plane']
+  
+
+  #################################################
+  # Wait for API server ready
+  #################################################
+  - name: Wait for API server
+    command: kubectl get nodes
+    register: api_ready
+    retries: 15
+    delay: 10
+    until: api_ready.rc == 0
+    environment:
+      KUBECONFIG: /etc/kubernetes/admin.conf
+    when: inventory_hostname in groups['k8s_control_plane']
+
+  #################################################
+  # Install Calico network
+  #################################################
+  - name: Install Calico network plugin
+    command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+    environment:
+      KUBECONFIG: /etc/kubernetes/admin.conf
+    when: inventory_hostname in groups['k8s_control_plane']
+
+  #################################################
+  # Join worker nodes
+  #################################################
+  - name: Get join command from control plane
+    command: kubeadm token create --print-join-command
+    register: join_command
+    run_once: true
+    delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+    environment:
+      KUBECONFIG: /etc/kubernetes/admin.conf
+    changed_when: false
+
+  - name: Set join command fact for all hosts
+    set_fact:
+      k8s_join_command: "{{ join_command.stdout }}"
+    run_once: true
+
+  # - name: Join worker nodes
+  #   command: "{{ k8s_join_command }} --ignore-preflight-errors=all"
+  #   args:
+  #     creates: /etc/kubernetes/kubelet.conf
+  #   when: inventory_hostname in groups['k8s_workers']
+  - name: Self-healing for worker node join
+    block:
+      - name: Check if kubelet.conf exists
+        stat:
+          path: /etc/kubernetes/kubelet.conf
+        register: kubelet_conf
+
+      - name: Reset worker node if kubelet.conf exists but node not in cluster
+        command: kubeadm reset -f
+        when:
+          - kubelet_conf.stat.exists
+          - inventory_hostname in groups['k8s_workers']
+
+      - name: Clean kubelet certificates
+        file:
+          path: /etc/kubernetes/pki
+          state: absent
+        when:
+          - kubelet_conf.stat.exists
+          - inventory_hostname in groups['k8s_workers']
+
+      - name: Get join command from control plane
+        command: kubeadm token create --print-join-command
+        run_once: true
+        delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+        register: join_command
+        changed_when: false
+
+      - name: Set join command fact
+        set_fact:
+          k8s_join_command: "{{ join_command.stdout }}"
+        run_once: true
+
+      - name: Join worker node
+        command: "{{ k8s_join_command }} --ignore-preflight-errors=all"
+        when: inventory_hostname in groups['k8s_workers']
+        args:
+          creates: /etc/kubernetes/kubelet.conf
+
+  #################################################
+  # Handlers
+  #################################################
+  handlers:
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+        enabled: yes
