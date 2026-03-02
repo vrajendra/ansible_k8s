@@ -305,44 +305,95 @@
   #   args:
   #     creates: /etc/kubernetes/kubelet.conf
   #   when: inventory_hostname in groups['k8s_workers']
-  - name: Self-healing for worker node join
-    block:
-      - name: Check if kubelet.conf exists
-        stat:
-          path: /etc/kubernetes/kubelet.conf
-        register: kubelet_conf
+  # - name: Self-healing for worker node join
+  #   block:
+  #     - name: Check if kubelet.conf exists
+  #       stat:
+  #         path: /etc/kubernetes/kubelet.conf
+  #       register: kubelet_conf
 
-      - name: Reset worker node if kubelet.conf exists but node not in cluster
-        command: kubeadm reset -f
-        when:
-          - kubelet_conf.stat.exists
-          - inventory_hostname in groups['k8s_workers']
+  #     - name: Reset worker node if kubelet.conf exists but node not in cluster
+  #       command: kubeadm reset -f
+  #       when:
+  #         - kubelet_conf.stat.exists
+  #         - inventory_hostname in groups['k8s_workers']
 
-      - name: Clean kubelet certificates
-        file:
-          path: /etc/kubernetes/pki
-          state: absent
-        when:
-          - kubelet_conf.stat.exists
-          - inventory_hostname in groups['k8s_workers']
+  #     - name: Clean kubelet certificates
+  #       file:
+  #         path: /etc/kubernetes/pki
+  #         state: absent
+  #       when:
+  #         - kubelet_conf.stat.exists
+  #         - inventory_hostname in groups['k8s_workers']
 
-      - name: Get join command from control plane
-        command: kubeadm token create --print-join-command
-        run_once: true
-        delegate_to: "{{ groups['k8s_control_plane'][0] }}"
-        register: join_command
-        changed_when: false
+  #     - name: Get join command from control plane
+  #       command: kubeadm token create --print-join-command
+  #       run_once: true
+  #       delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+  #       register: join_command
+  #       changed_when: false
 
-      - name: Set join command fact
-        set_fact:
-          k8s_join_command: "{{ join_command.stdout }}"
-        run_once: true
+  #     - name: Set join command fact
+  #       set_fact:
+  #         k8s_join_command: "{{ join_command.stdout }}"
+  #       run_once: true
 
-      - name: Join worker node
-        command: "{{ k8s_join_command }} --ignore-preflight-errors=all"
-        when: inventory_hostname in groups['k8s_workers']
-        args:
-          creates: /etc/kubernetes/kubelet.conf
+  #     - name: Join worker node
+  #       command: "{{ k8s_join_command }} --ignore-preflight-errors=all"
+  #       when: inventory_hostname in groups['k8s_workers']
+  #       args:
+  #         creates: /etc/kubernetes/kubelet.conf
+
+  #################################################
+# Smart Worker Join / Recovery Logic
+#################################################
+
+  - name: Check if kubelet.conf exists
+    stat:
+      path: /etc/kubernetes/kubelet.conf
+    register: kubelet_conf
+    when: inventory_hostname in groups['k8s_workers']
+
+  # Check if node is registered in cluster
+  - name: Check if worker is in cluster
+    command: kubectl get node {{ inventory_hostname }} -o json
+    register: node_status
+    failed_when: false
+    changed_when: false
+    run_once: false
+    delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+    environment:
+      KUBECONFIG: /etc/kubernetes/admin.conf
+    when: inventory_hostname in groups['k8s_workers']
+
+  # Reset ONLY if kubelet exists but node not found in cluster
+  - name: Reset broken worker
+    command: kubeadm reset -f
+    when:
+      - inventory_hostname in groups['k8s_workers']
+      - kubelet_conf.stat.exists
+      - node_status.rc != 0
+
+  # Generate join command once
+  - name: Generate join command
+    command: kubeadm token create --ttl 1h --print-join-command
+    register: join_command
+    run_once: true
+    delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+    environment:
+      KUBECONFIG: /etc/kubernetes/admin.conf
+    changed_when: false
+
+  # Join if:
+  # - brand new node (no kubelet.conf)
+  # - OR reset just happened
+  - name: Join worker node
+    command: "{{ join_command.stdout }}"
+    when:
+      - inventory_hostname in groups['k8s_workers']
+      - not kubelet_conf.stat.exists or node_status.rc != 0
+    args:
+      creates: /etc/kubernetes/kubelet.conf
 
   #################################################
   # Handlers
