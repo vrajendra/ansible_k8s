@@ -1,0 +1,17 @@
+---
+- name: Validate maintenance window
+  assert:
+    that:
+      - (ansible_date_time.hour | int >= upgrade_start_hour) or
+        (ansible_date_time.hour | int <= upgrade_end_hour)
+    fail_msg: "Upgrade attempted outside maintenance window"
+
+- name: Verify cluster nodes are Ready
+  command: kubectl get nodes --no-headers
+  register: cluster_status
+  changed_when: false
+
+- name: Fail if any node is NotReady
+  fail:
+    msg: "Cluster unhealthy. Some nodes are NotReady."
+  when: "'NotReady' in cluster_status.stdout"

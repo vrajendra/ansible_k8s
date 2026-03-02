@@ -1,0 +1,39 @@
+---
+# rollback main tasks — NO hosts: block here
+# This will be included from the playbook
+
+- name: Switch repo to previous version for rollback
+  import_tasks: rollback_repo.yml
+
+- name: Stop kubelet before rollback
+  systemd:
+    name: kubelet
+    state: stopped
+  ignore_errors: yes
+
+- name: Restore etcd snapshot
+  shell: |
+    ETCDCTL_API=3 etcdctl snapshot restore {{ etcd_snapshot_dir }}/etcd-backup-*.db \
+      --data-dir /var/lib/etcd
+  args:
+    warn: false
+  failed_when: false
+  
+- name: Unhold kubeadm, kubelet, kubectl
+  shell: |
+    sudo apt-mark unhold kubeadm kubelet kubectl
+  become: yes   
+
+- name: Downgrade kubeadm, kubelet, kubectl to previous version
+  apt:
+    name:
+      - kubeadm={{ previous_version }}
+      - kubelet={{ previous_version }}
+      - kubectl={{ previous_version }}
+    state: present
+    update_cache: yes
+
+- name: Restart kubelet after rollback
+  systemd:
+    name: kubelet
+    state: restarted

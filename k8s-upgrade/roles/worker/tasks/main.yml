@@ -1,0 +1,78 @@
+---
+- name: Detect pinned pods
+  shell: |
+    kubectl get pods --all-namespaces -o json \
+    --field-selector spec.nodeName={{ inventory_hostname }} \
+    | jq '.items[] | select(.spec.affinity != null or .spec.nodeSelector != null)'
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  register: pinned_pods
+  changed_when: false
+
+- name: Drain node
+  shell: kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  when: pinned_pods.stdout | length == 0
+
+- name: Ensure apt keyrings directory exists
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Download Kubernetes apt key for 1.32
+  get_url:
+    url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: '0644'
+
+- name: Add Kubernetes 1.32 apt repository
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+    state: present
+
+- name: Update apt cache
+  apt:
+    update_cache: yes  
+
+- name: Unhold kubeadm, kubelet, kubectl
+  shell: |
+    sudo apt-mark unhold kubeadm kubelet kubectl
+  become: yes 
+
+- name: Upgrade kubeadm
+  apt:
+    name: kubeadm={{ target_version }}
+    state: present
+    update_cache: yes
+
+- name: kubeadm upgrade node
+  command: kubeadm upgrade node
+
+- name: Upgrade kubelet
+  apt:
+    name: kubelet={{ target_version }}
+    state: present
+    update_cache: yes
+
+- name: Hold kubeadm, kubelet, kubectl after upgrade
+  shell: |
+    sudo apt-mark hold kubeadm kubelet kubectl
+  become: yes    
+
+- name: Restart kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+
+- name: Wait until node is Ready
+  shell: kubectl get nodes {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  register: node_ready
+  retries: 20
+  delay: 15
+  until: node_ready.stdout == "True"
+
+- name: Uncordon node
+  shell: kubectl uncordon {{ inventory_hostname }}
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"
+  when: pinned_pods.stdout | length == 0

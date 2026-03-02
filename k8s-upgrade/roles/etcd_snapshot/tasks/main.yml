@@ -1,0 +1,22 @@
+---
+- name: Check etcd health
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    endpoint health
+  register: etcd_health
+  changed_when: false
+
+- name: Fail if etcd unhealthy
+  fail:
+    msg: "etcd cluster unhealthy."
+  when: "'unhealthy' in etcd_health.stdout"
+
+- name: Take etcd snapshot
+  shell: |
+    ETCDCTL_API=3 etcdctl snapshot save {{ etcd_snapshot_dir }}/etcd-backup-{{ ansible_date_time.epoch }}.db \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key

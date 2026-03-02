@@ -1,0 +1,45 @@
+---
+
+- name: Unhold kubeadm, kubelet, kubectl
+  shell: |
+    sudo apt-mark unhold kubeadm kubelet kubectl
+  become: yes
+
+- name: Upgrade kubeadm
+  apt:
+    name: kubeadm={{ target_version }}
+    state: present
+    update_cache: yes
+
+- name: Apply upgrade (first CP)
+  command: kubeadm upgrade apply --force -y v{{ k8s_version }}
+  when: inventory_hostname == groups['kube_control_plane'][0]
+
+- name: Upgrade remaining CP nodes
+  command: kubeadm upgrade node
+  when: inventory_hostname != groups['kube_control_plane'][0]
+
+- name: Upgrade kubelet and kubectl
+  apt:
+    name:
+      - kubelet={{ target_version }}
+      - kubectl={{ target_version }}
+    state: present
+    update_cache: yes
+
+- name: Hold kubeadm, kubelet, kubectl after upgrade
+  shell: |
+    sudo apt-mark hold kubeadm kubelet kubectl
+  become: yes    
+
+- name: Restart kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+
+- name: Wait for API server
+  command: kubectl get nodes
+  register: api_check
+  retries: 20
+  delay: 15
+  until: api_check.rc == 0

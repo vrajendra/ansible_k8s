@@ -1,0 +1,104 @@
+---
+########################################################
+# 1️⃣ PRE-FLIGHT CHECK AND REPO UPDATE (FIRST CONTROL PLANE)
+########################################################
+
+- name: Preflight validation and repo update
+  hosts: kube_control_plane
+  become: yes
+  serial: 1   # first node only
+  tasks:
+    - name: Preflight validation
+      import_role:
+        name: preflight
+
+    - name: Ensure apt keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Kubernetes apt key for 1.32
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: '0644'
+
+    - name: Add Kubernetes 1.32 apt repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+########################################################
+# 2️⃣ ETCD SNAPSHOT (FIRST CONTROL PLANE)
+########################################################
+
+- name: Take etcd snapshot
+  hosts: kube_control_plane
+  become: yes
+  serial: 1
+  tasks:
+    - import_role:
+        name: etcd_snapshot
+
+########################################################
+# 3️⃣ FIRST CONTROL PLANE UPGRADE WITH ROLLBACK
+########################################################
+
+- name: Upgrade first control plane with rollback
+  hosts: kube_control_plane
+  become: yes
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - block:
+        - import_role:
+            name: control_plane
+      rescue:
+        - name: Rollback first control plane
+          import_role:
+            name: rollback
+
+########################################################
+# 4️⃣ REMAINING CONTROL PLANES
+########################################################
+
+- name: Upgrade remaining control planes
+  hosts: kube_control_plane
+  become: yes
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Skip first CP (already upgraded)
+      debug:
+        msg: "Skipping first control plane, only upgrading remaining nodes."
+      when: inventory_hostname == groups['kube_control_plane'][0]
+
+    - name: Upgrade control plane node
+      import_role:
+        name: control_plane
+      when: inventory_hostname != groups['kube_control_plane'][0]
+
+########################################################
+# 5️⃣ WORKERS IN BATCHES OF 5 WITH OPTIONAL ROLLBACK
+########################################################
+
+- name: Upgrade workers in batches
+  hosts: kube_workers
+  become: yes
+  serial: "{{ worker_batch_size }}"
+  tasks:
+    - block:
+        - import_role:
+            name: worker
+      rescue:
+        - name: Rollback failed worker
+          import_role:
+            name: rollback
+        - name: Debug host during rollback
+          debug:
+            msg: "Rolling back on {{ inventory_hostname }}"                
