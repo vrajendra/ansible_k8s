@@ -1,17 +1,26 @@
 ---
-- name: Detect pinned pods
-  shell: |
-    kubectl get pods --all-namespaces -o json \
-    --field-selector spec.nodeName={{ inventory_hostname }} \
-    | jq '.items[] | select(.spec.affinity != null or .spec.nodeSelector != null)'
-  delegate_to: "{{ groups['kube_control_plane'][0] }}"
-  register: pinned_pods
-  changed_when: false
+# - name: Detect pinned pods
+#   shell: |
+#     kubectl get pods --all-namespaces -o json \
+#     --field-selector spec.nodeName={{ inventory_hostname }} \
+#     | jq '.items[] | select(.spec.affinity != null or .spec.nodeSelector != null)'
+#   delegate_to: "{{ groups['kube_control_plane'][0] }}"
+#   register: pinned_pods
+#   changed_when: false
+
+# - name: Drain node
+#   shell: kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
+#   delegate_to: "{{ groups['kube_control_plane'][0] }}"
+#   when: pinned_pods.stdout | length == 0
 
 - name: Drain node
-  shell: kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
-  delegate_to: "{{ groups['kube_control_plane'][0] }}"
-  when: pinned_pods.stdout | length == 0
+  shell: >
+    kubectl drain {{ inventory_hostname }}
+    --ignore-daemonsets
+    --delete-emptydir-data
+    --grace-period=30
+    --timeout=300s
+  delegate_to: "{{ groups['kube_control_plane'][0] }}"  
 
 - name: Ensure apt keyrings directory exists
   file:
@@ -71,8 +80,9 @@
   retries: 20
   delay: 15
   until: node_ready.stdout == "True"
+  changed_when: false
 
 - name: Uncordon node
   shell: kubectl uncordon {{ inventory_hostname }}
   delegate_to: "{{ groups['kube_control_plane'][0] }}"
-  when: pinned_pods.stdout | length == 0
+  when: node_ready.stdout == "True"
